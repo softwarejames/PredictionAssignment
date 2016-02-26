@@ -1,0 +1,347 @@
+---
+title: 
+output: 
+  html_document:
+    keep_md: true
+---
+## Prediction Assignment Writeup: Barbell Lifts
+
+### Executive Summary
+Weight Lifting Exercises dataset is to investigate "how (well)" an activity was performed by the wearer. Six young health participants were asked to perform one set of 10 repetitions of the Unilateral Dumbbell Biceps Curl in five different fashions: exactly according to the specification (Class A), throwing the elbows to the front (Class B), lifting the dumbbell only halfway (Class C), lowering the dumbbell only halfway (Class D) and throwing the hips to the front (Class E).
+
+The goal of this project is to use data from accelerometers on the belt, forearm, arm, and dumbell of the 6 participants to predict the proper class of the barbell lift i.e. "classe" A, B, C, D, or E.
+
+Three classification models were individually created and evaluated then combined into an ensemble model to improve prediction. Training and testing of all models was performed using just the build data i.e. "pml-training.csv" which was 70/30 split into training and testing data sets. The final ensemble model was evaluated once against the validation data i.e. "pml-testing.csv" and resulted in a 90% prediction accuracy during automated grading.
+
+### Data Processing
+#### Load Libraries
+```{r, echo= TRUE, cache= TRUE, message= FALSE, comment= NA, warning= FALSE}
+#load libraries and set options
+library(caret)
+library(dplyr)
+options(dplyr.width = Inf, dplyr.print_max = 1000)
+```
+
+#### Load Data
+Load the Weight Lifting Exercises files. Assign the 'pml-training.csv' data set to model building. Assign the 'pml-testing.csv' data set to final validation.
+```{r, echo= TRUE, cache= TRUE, message= FALSE, comment= NA, warning= FALSE}
+#load model building data
+build0_data <- read.csv(file = 'pml-training.csv')
+
+#load validation data
+valid0_data <- read.csv(file = 'pml-testing.csv')
+```
+
+#### Pre-process Data
+Pre-process the model build and validation data sets by removing fields that have more than 50% as NA or empty field as well as fields that are timestamps.
+```{r, echo= TRUE, cache= TRUE, message= FALSE, comment= NA, warning= FALSE}
+#model building subset
+#valid values per column threshold percent
+invalid_thresh <- 0.50
+
+#remove fields with NA values over threshold value from data sets
+build1_data <- build0_data[, colSums(is.na(build0_data)) 
+                                 <= nrow(build0_data) * invalid_thresh]
+
+#remove fields with empty values over threshold value from data sets
+build1_data <- build1_data[, colSums(build1_data == '') 
+                                 <= nrow(build1_data) * invalid_thresh]
+
+#remove timestamp fields
+build1_data <- build1_data %>%
+                   select(-contains('timestamp')
+)
+
+#----------
+#validation subset
+#match validation data set columns used to build subset
+col_pattern <- paste('^',
+                     colnames(build1_data),
+                     '$',
+                     sep = '',
+                     collapse = '|'
+)
+
+#include problem_id field in validation data
+col_pattern <- paste(col_pattern,
+                     '^problem_id$',
+                     sep = '|'
+)
+
+valid1_data <- valid0_data[, grep(col_pattern, colnames(valid0_data))]
+```
+
+#### Create Model Building Training and Test Data Sets
+Randomly split the model build data set with 70% used in the model training data set and 30% used in the testing data set. Define the 'classe' variable as the factor to evenly distribute among the splits.
+```{r, echo= TRUE, cache= TRUE, message= FALSE, comment= NA, warning= FALSE}
+#training subset
+train1_flag <- createDataPartition(y = build1_data$classe,
+                                   p = 0.7,
+                                   list = FALSE
+)
+
+train1_data <- build1_data[train1_flag, ]
+
+#----------
+#testing subset
+test1_data <- build1_data[-train1_flag, ]
+```
+
+### Random Forest Model (RF)
+#### Train and Test Model
+Pre-process the training data using Principle Components Analysis (PCA) with a 50% variance explained threshold to scale, center, and limit variables used in model. Higher thresholds of 65%, 80%, and 95% levels were investigated but yielded significant model overfitting. Use 10-fold cross validation to train the model.
+```{r, echo= TRUE, cache= TRUE, message= FALSE, comment= NA, warning= FALSE}
+#set training and pre-processing parameters
+trainrf1_ctrl <- trainControl(method = 'cv',
+                              preProcOptions = list(thresh = 0.50)
+)
+
+#create training model
+set.seed(100)
+
+trainrf1_model <- train(classe ~ ., 
+                        data = train1_data, 
+                        method = 'rf',
+                        preProcess = c('pca'),
+                        trControl = trainrf1_ctrl
+)
+
+#create predictions on test data
+testrf1_pred <- predict(trainrf1_model,
+                        newdata = test1_data
+)
+```
+
+#### Model Results
+Final fitted model details built on training data set.
+```{r, echo= TRUE, cache= TRUE, message= FALSE, comment= NA, warning= FALSE, fig.height= 4, fig.width= 6}
+#training
+#model details
+trainrf1_model$finalModel
+
+#model plot
+plot(main = 'Figure 1: Random Forest Model', trainrf1_model)
+```
+
+Prediction results using fitted model on testing data set.
+```{r, echo= TRUE, cache= TRUE, message= FALSE, comment= NA, warning= FALSE}
+#testing
+#model results
+testrf1_result <- confusionMatrix(data = testrf1_pred,
+                                  reference = test1_data$classe
+)
+
+testrf1_result
+```
+
+Final model was chosen based on overall accuracy having ```r trainrf1_model$finalModel$mtry``` variables at each split using ```r trainrf1_model$finalModel$ntree``` trees.
+
+Overall accuracy of model prediction on test data set is ```r round(testrf1_result$overall['Accuracy'], 3)``` or an expected error rate of ```r 1 - round(testrf1_result$overall['Accuracy'], 3)```
+
+
+### Gradient Boosting Machine (GBM)
+#### Train and Test Model
+Pre-process the training data using Principle Components Analysis (PCA) with a 50% variance explained threshold to scale, center, and limit variables used in model. Higher thresholds of 65%, 80%, and 95% levels were investigated but yielded significant model overfitting. Use 10-fold cross validation to train the model. Use a tuning grid to optimize for best training parameters i.e. number of trees 100 or 300, shrinkage 0.1 or 0.01, and interaction depth 1 or calculated maximum based on variable count. Set minimum observations in node to 10.
+```{r, echo= TRUE, cache= TRUE, message= FALSE, comment= NA, warning= FALSE}
+#training
+#max interaction.depth
+mtry_def <- floor(sqrt(ncol(train1_data)))
+
+#set tuning grid for model parameters
+traingbm1_grid <- expand.grid(interaction.depth = c(1, mtry_def),
+                              n.trees = c(100, 300),
+                              shrinkage = c(0.1, 0.01),
+                              n.minobsinnode = c(10)
+)
+
+#set training and pre-processing parameters
+traingbm1_ctrl <- trainControl(method = 'cv',
+                               allowParallel = FALSE,
+                               preProcOptions = list(thresh = 0.50)
+)
+
+#create training model
+set.seed(100)
+
+traingbm1_model <- train(classe ~ ., 
+                         data = as.data.frame(train1_data), 
+                         method = 'gbm',
+                         tuneGrid = traingbm1_grid,
+                         preProcess = c('pca'),
+                         trControl = traingbm1_ctrl,
+                         verbose = FALSE
+)
+
+#create predictions on test data
+testgbm1_pred <- predict(traingbm1_model,
+                         newdata = test1_data
+)
+```
+
+#### Model Results
+Final fitted model details built on training data set.
+```{r, echo= TRUE, cache= TRUE, message= FALSE, comment= NA, warning= FALSE, fig.height= 4, fig.width= 8}
+#training
+#model details
+traingbm1_model$finalModel
+
+#model plot
+plot(main = 'Figure 2: Gradient Boosting Machine Model', traingbm1_model)
+```
+
+Prediction results using fitted model on testing data set.
+```{r, echo= TRUE, cache= TRUE, message= FALSE, comment= NA, warning= FALSE}
+#testing
+#model results
+testgbm1_result <- confusionMatrix(data = testgbm1_pred,
+                                   reference = test1_data$classe
+)
+
+testgbm1_result
+```
+
+Final model was chosen based on overall accuracy having an interaction depth of ```r traingbm1_model$finalModel$interaction.depth``` with ```r traingbm1_model$finalModel$interaction.shrinkage``` shrinkage using ```r trainrf1_model$finalModel$n.trees``` trees.
+
+Overall accuracy of model prediction on test data set is ```r round(testgbm1_result$overall['Accuracy'], 3)``` or an expected error rate of ```r 1 - round(testgbm1_result$overall['Accuracy'], 3)```
+
+
+### Neural Network (NNET)
+#### Train and Test Model
+Pre-process the training data using Principle Components Analysis (PCA) with a 50% variance explained threshold to scale, center, and limit variables used in model. Higher thresholds of 65%, 80%, and 95% levels were investigated but yielded significant model overfitting. Use 10-fold cross validation to train the model. Use a tuning grid to optimize for best training parameters i.e. decay of 0, 0.01, or 0.1 and size of 1, 5, 10, or 20 hidden units. Size of 20 hidden units is close to max allowable given current variable set. Set max iterations to 500.
+```{r, echo= TRUE, cache= TRUE, message= FALSE, comment= NA, warning= FALSE}
+#training
+#max node weights
+max_nwt <- 5 * (ncol(train1_data) + 1) + 5 + 1
+
+#set tuning grid for model parameters
+trainnet1_grid <- expand.grid(decay = c(0, 0.01, 0.1),
+                              size = c(1, 5, 10, 20)
+)
+
+#set training and pre-processing parameters
+trainnet1_ctrl <- trainControl(method = 'cv',
+                               allowParallel = FALSE,
+                               preProcOptions = list(thresh = 0.50)
+)
+
+#create training model
+set.seed(100)
+
+trainnet1_model <- train(classe ~ ., 
+                         data = as.data.frame(train1_data), 
+                         method = 'nnet',
+                         tuneGrid = trainnet1_grid,
+                         preProcess = c('pca'),
+                         trControl = trainnet1_ctrl,
+                         MaxNWts = max_nwt,
+                         maxit = 500,
+                         bag = FALSE,
+                         linout =TRUE,
+                         trace = FALSE
+)
+
+#create predictions on test data
+testnet1_pred <- predict(trainnet1_model,
+                         newdata = test1_data
+)
+```
+
+#### Model Results
+Final fitted model details built on training data set.
+```{r, echo= TRUE, cache= TRUE, message= FALSE, comment= NA, warning= FALSE, fig.height= 4, fig.width= 6}
+#training
+#model details
+trainnet1_model$finalModel
+
+#model plot
+plot(main = 'Figure 3: Neural Network Model', trainnet1_model)
+```
+
+Prediction results using fitted model on testing data set.
+```{r, echo= TRUE, cache= TRUE, message= FALSE, comment= NA, warning= FALSE}
+#testing
+#model results
+testnet1_result <- confusionMatrix(data = testnet1_pred,
+                                   reference = test1_data$classe
+)
+
+testnet1_result
+```
+
+Final model was chosen based on overall accuracy having ```r trainnet1_model$finalModel$tuneValue$decay``` decay with size ```r trainnet1_model$finalModel$tuneValue$size``` hidden units.
+
+Overall accuracy of model prediction on test data set is ```r round(testnet1_result$overall['Accuracy'], 3)``` or an expected error rate of ```r 1 - round(testnet1_result$overall['Accuracy'], 3)```
+
+
+### Ensemble (combine RF, GBM, and NNET models)
+#### Train and Validate Model
+Combine the previously created random forest, gradient boosting machine, and neural network models into an ensemble model. Neural network model was included even though it had a much lower accuracy than the other two models since it uses a completely different algorithm than RF or GBM. Train the ensemble model using a random forest method with bootstrap.
+```{r, echo= TRUE, cache= TRUE, message= FALSE, comment= NA, warning= FALSE}
+#training
+#create data set of predicted values from test data using the RF, GBM, and NNET models
+trainens1_data <- data.frame(rf_pred = testrf1_pred,
+                             gbm_pred = testgbm1_pred,
+                             net_pred = testnet1_pred,
+                             classe = test1_data$classe
+)
+
+#create training model
+set.seed(100)
+
+trainens1_model <- train(classe ~ .,
+                         method = 'rf',
+                         data = trainens1_data,
+                         trControl = trainControl(method = 'boot')
+)
+
+#----------
+#validation
+#random forest predictions on validation data
+validrf1_pred <- predict(trainrf1_model,
+                         newdata = valid1_data
+)
+
+#gradient boosting machine predictions on validation data
+validgbm1_pred <- predict(traingbm1_model,
+                          newdata = valid1_data
+)
+
+#neural network predictons on validation data
+validnet1_pred <- predict(trainnet1_model,
+                          newdata = valid1_data
+)
+
+#-----
+#create data set of predicted values from validation data using the RF, GBM, and NNET models
+validens1_data <- data.frame(rf_pred = validrf1_pred,
+                             gbm_pred = validgbm1_pred,
+                             net_pred = validnet1_pred
+)
+
+#create predictions on validation data
+validens1_pred <- predict(trainens1_model,
+                          newdata = validens1_data
+)
+
+#cbind(validens1_data, validens1_pred)
+```
+
+#### Model Results
+Final fitted model details built on training data set.
+```{r, echo= TRUE, cache= TRUE, message= FALSE, comment= NA, warning= FALSE, fig.height= 4, fig.width= 6}
+#training
+#model details
+trainens1_model$finalModel
+
+#model plot
+plot(main = 'Figure 4: Ensemble Model\n(RF, GBM, NNET)', trainens1_model)
+```
+
+Final model was chosen based on overall accuracy having ```r trainens1_model$finalModel$mtry``` variables at each split
+
+
+### Final Results
+The final ensemble model was evaluated once against the validation data i.e. "pml-testing.csv" and resulted in a 90% prediction accuracy during automated grading.
+
+Prediction results on validation data:
+```r paste(valid1_data$problem_id, '-', validens1_pred, sep = '')```
